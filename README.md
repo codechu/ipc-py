@@ -1,10 +1,15 @@
 ```text
-   ┌─────────────────┐      ╔═════════════════╗
-   │  codechu — ipc  │═════>║   your daemon   ║
-   │  client         │ JSON ║   handler(req)  ║
-   │  request()      │<═════║   → response    ║
-   └─────────────────┘ line ╚═════════════════╝
-        unix socket  ·  fifo  ·  json-line  ·  pidfile
+━━━━━━━━━━━━ c o d e c h u  ·  i p c ━━━━━━━━━━━━
+
+   $ nc -U /run/codechu/myapp/control.sock
+   {"cmd":"status"}
+   {"running":true,"queue":42,"uptime":"3h12m"}
+   {"cmd":"reload","section":"watchdog"}
+   {"ok":true}
+
+   unix socket  ·  fifo  ·  json-line  ·  pidfile
+
+━━━━━━━━ local IPC the deliberately-boring way. ━━━━━━━━
 ```
 
 [![PyPI](https://img.shields.io/pypi/v/codechu-ipc.svg)](https://pypi.org/project/codechu-ipc/)
@@ -21,12 +26,6 @@ sockets, named pipes (FIFOs), JSON-line framing, pidfile lifecycle.
 The deliberately-boring option for when you need a daemon and a
 control socket and don't want gRPC, dbus, or a 200 MB dependency
 tree.
-
-```text
-$ nc -U /run/codechu/myapp/control.sock
-{"cmd":"status"}
-{"running":true,"queue":42,"uptime":"3h12m"}
-```
 
 ## Install
 
