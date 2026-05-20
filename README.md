@@ -17,11 +17,16 @@
 # codechu-ipc
 
 Stdlib-only local IPC for Linux daemons and sidecars: Unix domain
-sockets, named pipes (FIFOs), JSON-line framing, server lifecycle
-helpers. No third-party dependencies. Python 3.10+.
+sockets, named pipes (FIFOs), JSON-line framing, pidfile lifecycle.
+The deliberately-boring option for when you need a daemon and a
+control socket and don't want gRPC, dbus, or a 200 MB dependency
+tree.
 
-Linux is the primary target; BSD/macOS are best-effort (anything
-POSIX-y with `AF_UNIX` and `mkfifo` should work).
+```text
+$ nc -U /run/codechu/myapp/control.sock
+{"cmd":"status"}
+{"running":true,"queue":42,"uptime":"3h12m"}
+```
 
 ## Install
 
@@ -29,155 +34,88 @@ POSIX-y with `AF_UNIX` and `mkfifo` should work).
 pip install codechu-ipc
 ```
 
-## API at a glance
+Python 3.10+. Zero third-party dependencies. Linux is the primary
+target; BSD / macOS are best-effort.
+
+## Quick example
 
 ```python
 from codechu_ipc import UnixServer, UnixClient, FifoChannel, pidfile
 
-# --- Server side ------------------------------------------------------
-def handler(req: dict) -> dict:
-    return {"echo": req}
+# --- Server ----------------------------------------------------------
+def handler(req: dict) -> dict | None:
+    if req["cmd"] == "status":
+        return {"running": True}
+    if req["cmd"] == "shutdown":
+        signal_stop()
+        return None                  # → notification, no response
 
-with UnixServer("/run/codechu/myapp/control.sock", handler):
-    ...  # serve until the context exits
-
-# --- Client side ------------------------------------------------------
-client = UnixClient("/run/codechu/myapp/control.sock")
-response = client.request({"cmd": "status"})       # → {"echo": ...}
-client.notify({"cmd": "shutdown"})                  # fire-and-forget
-
-# --- FIFO -------------------------------------------------------------
-ch = FifoChannel("/run/codechu/myapp/events.fifo")
-ch.send({"event": "rescan-done"})                   # non-blocking
-msg = ch.recv()                                     # blocks for next
-
-# --- Lifecycle --------------------------------------------------------
-with pidfile("/run/codechu/myapp/daemon.pid"):
+with pidfile("/run/codechu/myapp/daemon.pid"), \
+     UnixServer("/run/codechu/myapp/control.sock", handler):
     serve_forever()
+
+# --- Client ----------------------------------------------------------
+client = UnixClient("/run/codechu/myapp/control.sock")
+client.request({"cmd": "status"})    # → {"running": True}
+client.notify({"cmd": "shutdown"})   # fire-and-forget
+
+# --- FIFO (one-way event stream) -------------------------------------
+ch = FifoChannel("/run/codechu/myapp/events.fifo")
+ch.send({"event": "rescan-done"})
+msg = ch.recv()
 ```
+
+## What you get
+
+- **`UnixServer(path, handler)`** — accept-loop thread, one worker
+  per connection, owner-only socket (`0o600`) by default. Cleans
+  stale sockets from prior crashed runs; refuses to overwrite a
+  live one. Handler exceptions become JSON error responses.
+- **`UnixClient(path)`** — `request()` (await response),
+  `notify()` (fire-and-forget). Optional retries + backoff for
+  start-up races against the server.
+- **`FifoChannel(path)`** — bidirectional named-pipe helper with
+  the same JSON-line framing as the socket transport.
+- **`JsonLineProtocol`** — the shared framing primitive: one JSON
+  object per `\n`-terminated line. Trivial to inspect with
+  `nc -U` or `socat`.
+- **`pidfile(path)`** — context manager that writes the current
+  PID and removes the file on exit; refuses to start if a live
+  process is already there.
 
 ## Why JSON-line?
 
-- **One object per line.** Trivial to parse from any language, any
-  shell pipeline, any log viewer.
-- **No length prefixes, no schemas.** Easy to inspect with `nc -U`
-  or `socat` while debugging.
-- **Backpressure is the OS's problem.** The kernel's socket buffers
-  do the queuing; this library stays a thin wrapper.
+One object per line. No length prefixes, no schemas, no framing
+bugs. Easy to tail, easy to pipe, easy to debug. Backpressure is
+the OS socket buffer's problem. If you need binary framing,
+multiplexing, or RPC semantics — use gRPC, not this.
 
-If you need binary framing, multiplexing, or RPC semantics, you want
-gRPC, not this.
+## Read more
 
-## `UnixServer(path, handler, *, mode=0o600, backlog=16)`
+- [API reference](docs/API.md) — every public symbol with full
+  signatures.
+- [Changelog](CHANGELOG.md)
 
-- Background accept-loop thread; one worker thread per connection.
-- Default socket permissions: **owner-only (0o600)**. Override with
-  `mode=`.
-- Auto-cleans stale socket files from a crashed previous run; refuses
-  to overwrite a live socket (raises `FileExistsError`).
-- Handler returning `None` means "this was a notification, send no
-  response". Anything else is encoded back as one JSON line.
-- Handler exceptions are caught and returned to the client as
-  `{"error": "...", "type": "..."}` — the server keeps serving.
-- Context manager: `with UnixServer(...) as srv: ...` calls
-  `start()`/`stop()` for you.
-
-## `UnixClient(path, *, timeout=5.0, retries=3, retry_backoff=0.5)`
-
-- `request(payload)` — send a JSON line, read one back.
-- `notify(payload)` — send a JSON line, close. No response read.
-- Retries on `ConnectionRefusedError` / `FileNotFoundError`, with
-  exponential backoff (`0.5s, 1.0s, 2.0s, ...`). Useful for the
-  short window between "daemon is starting" and "daemon is ready".
-
-## `JsonLineProtocol`
-
-The framing helper, exposed so you can build your own transport on
-top of it.
-
-```python
-data = JsonLineProtocol.encode({"hello": "world"})  # → b'{"hello":"world"}\n'
-
-with open("/var/log/myapp.jsonl", "rb") as f:
-    for obj in JsonLineProtocol.decode_stream(f):
-        print(obj)
-```
-
-## `FifoChannel(path, *, mode=0o600)`
-
-- Auto-creates the FIFO with `mkfifo` if missing.
-- `send()` opens write-side non-blocking — raises `BrokenPipeError`
-  if no reader is attached, so you don't deadlock.
-- `recv()` opens read-side blocking and yields one decoded message.
-- FIFOs are unidirectional; for request/response use `UnixServer`.
-
-## `pidfile(path)`
-
-Context manager that:
-
-1. Creates the parent directory.
-2. Opens the pidfile and acquires an exclusive `flock`.
-3. If another process holds the lock, raises `BlockingIOError`
-   immediately — perfect for "don't start twice" guards.
-4. Writes the current PID, releases the lock, removes the file on
-   exit (including exceptions).
-
-```python
-try:
-    with pidfile("/run/codechu/myapp/daemon.pid"):
-        run()
-except BlockingIOError:
-    sys.exit("already running")
-```
-
-## Design
-
-- **Pure stdlib.** `socket`, `threading`, `fcntl`, `os`, `json` — no
-  more. The whole library is five small modules.
-- **Linux-first.** AF_UNIX, `mkfifo`, `flock` — all POSIX, but Linux
-  is the platform we run CI on. BSD/macOS work in practice.
-- **No magic.** No global registry, no event loop, no decorators.
-  You start the server, you stop the server.
-- **Crash-safe.** Stale socket files are detected on startup; pidfiles
-  are removed on exit; handler exceptions don't kill the server.
-
-## Tests
-
-```bash
-pip install -e ".[dev]"
-pytest -q
-ruff check src tests
-```
-
-## Documentation
-
-- [API reference](docs/API.md) — every public symbol, signatures, edge cases
-
-## Codechu family
-
-Companion libraries from the Codechu Python ecosystem:
+## Family
 
 | Library | Purpose |
 |---------|---------|
-| [codechu-fmt](https://pypi.org/project/codechu-fmt/) | Human-readable formatting — sizes, durations, rates, percent |
-| [codechu-meter](https://pypi.org/project/codechu-meter/) | Timing primitives — Stopwatch, ETA, percentile, histogram |
-| [codechu-spark](https://pypi.org/project/codechu-spark/) | Unicode sparklines, mini bar charts, heatmaps |
-| [codechu-cli](https://pypi.org/project/codechu-cli/) | CLI primitives — colors, progress, spinners, prompts, table |
-| [codechu-events](https://pypi.org/project/codechu-events/) | Thread-safe multi-channel pub/sub bus with replay |
+| [codechu-events](https://pypi.org/project/codechu-events/) | Thread-safe multi-channel pub/sub bus |
+| [codechu-log](https://pypi.org/project/codechu-log/) | Structured logging — context, JSON, rotation |
 | [codechu-xdg](https://pypi.org/project/codechu-xdg/) | XDG Base Directory helpers, vendor-namespaced |
-| [codechu-treeviz](https://pypi.org/project/codechu-treeviz/) | Tree visualization — treemap, sunburst, icicle, flame |
-| [codechu-fs](https://pypi.org/project/codechu-fs/) | Filesystem primitives — atomic write, XDG trash, safe walk |
-| [codechu-term](https://pypi.org/project/codechu-term/) | Terminal capability detection, alt buffer, raw mode |
-| [codechu-color](https://pypi.org/project/codechu-color/) | Color palettes, WCAG contrast, color-blind variants |
-| [codechu-treedata](https://pypi.org/project/codechu-treedata/) | N-ary tree data structures and algorithms |
-| [codechu-log](https://pypi.org/project/codechu-log/) | Structured logging — context, JSON, rotation, redaction |
-| [codechu-i18n](https://pypi.org/project/codechu-i18n/) | Internationalization — locale, plural rules, RTL |
+| [codechu-fs](https://pypi.org/project/codechu-fs/) | Filesystem primitives — atomic write, XDG trash |
 | [codechu-config](https://pypi.org/project/codechu-config/) | Schema-driven config — atomic save, migrations |
+
+Full ecosystem: [github.com/codechu](https://github.com/codechu).
 
 ## Credits
 
-- Unix domain socket + FIFO primitives per POSIX; JSON-line protocol convention from ndjson.org.
+- JSON-line convention per [jsonlines.org](https://jsonlines.org/).
+- POSIX `AF_UNIX` semantics per the
+  [Linux unix(7) manual page](https://man7.org/linux/man-pages/man7/unix.7.html).
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Part of [Codechu](https://github.com/codechu).
